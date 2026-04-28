@@ -1,81 +1,78 @@
 from flask import Flask, request, jsonify
 import pytesseract
 from PIL import Image
+import fitz  # PyMuPDF — already in requirements.txt
 import io
 import re
-import pdf2image
 import os
-import tempfile
 
 app = Flask(__name__)
 
-def extract_text_from_image(image_bytes):
-    """Run Tesseract OCR on image bytes, return raw text."""
-    image = Image.open(io.BytesIO(image_bytes))
-    # Use both standard and Aadhaar-optimized config
-    text = pytesseract.image_to_string(image, lang='eng', config='--psm 6')
-    return text
+# ────────────────────────────────────────
+# OCR HELPERS
+# ────────────────────────────────────────
 
-def extract_text_from_pdf(pdf_bytes):
-    """Convert PDF pages to images, OCR each, return combined raw text."""
-    with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as tmp:
-        tmp.write(pdf_bytes)
-        tmp_path = tmp.name
-    try:
-        pages = pdf2image.convert_from_path(tmp_path, dpi=200)
-        all_text = ''
-        for page in pages:
-            buf = io.BytesIO()
-            page.save(buf, format='PNG')
-            text = pytesseract.image_to_string(
-                Image.open(io.BytesIO(buf.getvalue())),
-                lang='eng',
-                config='--psm 6'
-            )
-            all_text += text + '\n'
-        return all_text
-    finally:
-        os.unlink(tmp_path)
+def ocr_image_bytes(image_bytes):
+    """Run Tesseract on raw image bytes, return raw text."""
+    image = Image.open(io.BytesIO(image_bytes))
+    return pytesseract.image_to_string(image, lang='eng', config='--psm 6')
+
+def ocr_pdf_bytes(pdf_bytes):
+    """
+    Convert each PDF page to image using PyMuPDF (fitz),
+    OCR each page, return combined raw text.
+    """
+    doc = fitz.open(stream=pdf_bytes, filetype='pdf')
+    all_text = ''
+    for page in doc:
+        # Render page to image at 2x zoom for better OCR accuracy
+        mat  = fitz.Matrix(2, 2)
+        pix  = page.get_pixmap(matrix=mat)
+        img  = Image.frombytes('RGB', [pix.width, pix.height], pix.samples)
+        text = pytesseract.image_to_string(img, lang='eng', config='--psm 6')
+        all_text += text + '\n'
+    doc.close()
+    return all_text
+
+# ────────────────────────────────────────
+# NUMBER EXTRACTION
+# ────────────────────────────────────────
 
 def find_aadhaar_numbers(text):
     """
-    Extract valid-looking 12-digit Aadhaar numbers from text.
-    Filters out phone numbers and other IDs.
+    Extract valid-looking 12-digit numbers from text.
+    Filters out phone numbers and numbers starting with 0.
     """
-    # Match spaced format: 7331 2040 5238
-    spaced = re.findall(r'\b\d{4}\s\d{4}\s\d{4}\b', text)
-    spaced = [n.replace(' ', '') for n in spaced]
-
-    # Match unspaced: 733120405238
+    spaced   = re.findall(r'\b\d{4}\s\d{4}\s\d{4}\b', text)
+    spaced   = [n.replace(' ', '') for n in spaced]
     unspaced = re.findall(r'\b\d{12}\b', text)
 
-    all_nums = list(dict.fromkeys(spaced + unspaced))  # deduplicate, preserve order
+    all_nums = list(dict.fromkeys(spaced + unspaced))  # deduplicate, keep order
 
-    # Filter phone numbers (starts with 91 + mobile digit 6-9)
     result = []
     for num in all_nums:
         if num.startswith('91') and num[2] in '6789':
-            continue
+            continue  # phone number
         if num.startswith('0'):
             continue
         result.append(num)
-
     return result
 
+# ────────────────────────────────────────
+# DIRECT TEXT SEARCH
+# Search for entered number in raw text
+# across multiple spacing/format variants
+# ────────────────────────────────────────
+
 def search_in_text(text, entered):
-    """
-    Directly search for entered number in raw OCR text.
-    Checks multiple formats: no-space, spaced, dashed.
-    """
     if not text or not entered or len(entered) != 12:
         return False
 
-    # No-space search
-    no_space = re.sub(r'\s+', '', text)
-    if entered in no_space:
+    # No spaces: 733120405238
+    if entered in re.sub(r'\s+', '', text):
         return True
 
-    # Spaced: 7331 2040 5238
+    # Spaced groups of 4: 7331 2040 5238
     spaced = f"{entered[:4]} {entered[4:8]} {entered[8:12]}"
     if spaced in text:
         return True
@@ -87,30 +84,34 @@ def search_in_text(text, entered):
 
     return False
 
+# ────────────────────────────────────────
+# MAIN ROUTE
+# ────────────────────────────────────────
+
 @app.route('/ocr', methods=['POST'])
 def ocr():
     try:
         if 'content' not in request.files:
-            return jsonify({'error': 'No file uploaded'}), 400
+            return jsonify({'error': 'No file uploaded', 'aadhaarNumbers': [], 'rawText': '', 'enteredFound': False}), 400
 
-        file        = request.files['content']
-        file_bytes  = file.read()
-        filename    = file.filename.lower()
-        entered     = request.form.get('entered_number', '').strip()  # NEW
+        file          = request.files['content']
+        file_bytes    = file.read()
+        filename      = (file.filename or '').lower()
+        entered       = request.form.get('entered_number', '').strip()
 
-        # OCR
+        # ── OCR ──────────────────────────────────────
         if filename.endswith('.pdf'):
-            raw_text = extract_text_from_pdf(file_bytes)
+            raw_text = ocr_pdf_bytes(file_bytes)
         else:
-            raw_text = extract_text_from_image(file_bytes)
+            raw_text = ocr_image_bytes(file_bytes)
 
-        print(f"[OCR] raw text snippet: {raw_text[:150]}")
+        print(f"[OCR] snippet: {raw_text[:150]!r}")
 
-        # Extract Aadhaar numbers
+        # ── Extract numbers ───────────────────────────
         aadhaar_numbers = find_aadhaar_numbers(raw_text)
-        print(f"[OCR] extracted numbers: {aadhaar_numbers}")
+        print(f"[OCR] extracted: {aadhaar_numbers}")
 
-        # Direct search for entered number  ← NEW
+        # ── Direct search for entered number ──────────
         entered_found = False
         if entered and len(entered) == 12:
             entered_found = search_in_text(raw_text, entered)
@@ -118,14 +119,19 @@ def ocr():
 
         return jsonify({
             'aadhaarNumbers': aadhaar_numbers,
-            'rawText':        raw_text,        # NEW — Catalyst searches this too
-            'enteredFound':   entered_found,   # NEW — direct answer to "is it there?"
+            'rawText':        raw_text,       # Catalyst also searches this
+            'enteredFound':   entered_found,  # direct answer: is it there?
             'success':        True
         })
 
     except Exception as e:
-        print(f"[ERROR] {str(e)}")
-        return jsonify({'error': str(e), 'aadhaarNumbers': [], 'rawText': '', 'enteredFound': False}), 500
+        print(f"[ERROR] {e}")
+        return jsonify({
+            'error':          str(e),
+            'aadhaarNumbers': [],
+            'rawText':        '',
+            'enteredFound':   False
+        }), 500
 
 @app.route('/health', methods=['GET'])
 def health():
