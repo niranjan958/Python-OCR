@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: aadhaar-ocr-fallback
+    name: aadhaar-ocr
     env: docker
     region: singapore
     plan: free
